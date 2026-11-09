@@ -135,6 +135,11 @@ impl IntegrationTester {
     }
 
     fn reset(&mut self) {
+        let conf_file = self.conf_file.clone();
+        self.reset_with_conf(&conf_file);
+    }
+
+    fn reset_with_conf(&mut self, conf_file: &str) {
         // end usbsas
         self.usbsas.comm.end().expect("end usbsas");
 
@@ -148,7 +153,7 @@ impl IntegrationTester {
 
         // start new usbsas
         self.usbsas = UsbsasChildSpawner::new("usbsas-usbsas")
-            .args(&["-c", &self.conf_file])
+            .args(&["-c", conf_file])
             .spawn::<ComRqUsbsas>()
             .expect("can't spawn usbsas");
     }
@@ -248,6 +253,88 @@ impl IntegrationTester {
         Ok(())
     }
 
+    // USB to USB transfer with max_depth = 2: "/quiche/plop" can't be browsed
+    // and its content isn't transferred
+    fn usb_to_usb_max_depth(&mut self) -> Result<(), Box<dyn Error>> {
+        let devices = self
+            .comm()
+            .devices(proto::usbsas::RequestDevices { include_alt: false })?
+            .devices;
+        let find_dev = |src: bool| {
+            devices
+                .iter()
+                .find(|dev| match &dev.device {
+                    Some(device) => {
+                        matches!(device, Device::Usb(_))
+                            && if src {
+                                device.is_src()
+                            } else {
+                                device.is_dst()
+                            }
+                    }
+                    None => false,
+                })
+                .expect("couldn't find device")
+                .id
+        };
+        let (in_id, out_id) = (find_dev(true), find_dev(false));
+
+        let _ = self.comm().userid(proto::usbsas::RequestUserId {})?;
+        self.comm()
+            .inittransfer(proto::usbsas::RequestInitTransfer {
+                source: in_id,
+                destination: out_id,
+                fstype: Some(FsType::Ntfs.into()),
+                pin: None,
+            })?;
+        let _ = self
+            .comm()
+            .partitions(proto::usbsas::RequestPartitions {})?;
+        let _ = self
+            .comm()
+            .openpartition(proto::usbsas::RequestOpenPartition { index: 1 })?;
+
+        let rep = self.comm().readdir(proto::usbsas::RequestReadDir {
+            path: "/quiche".into(),
+        })?;
+        assert!(!rep.max_depth_reached);
+        assert!(rep.filesinfo.iter().any(|f| f.path == "/quiche/plop"));
+
+        let rep = self.comm().readdir(proto::usbsas::RequestReadDir {
+            path: "/quiche/plop".into(),
+        })?;
+        assert!(rep.max_depth_reached);
+        assert!(rep.filesinfo.is_empty());
+
+        let _ = self.comm().selectfiles(proto::usbsas::RequestSelectFiles {
+            selected: vec!["/".into()],
+        })?;
+        loop {
+            let resp = self.usbsas.comm.recv_status()?;
+            if resp.status == Status::AllDone.into() {
+                break;
+            }
+        }
+
+        let report = self
+            .comm()
+            .report(proto::usbsas::RequestReport {})?
+            .report
+            .unwrap();
+        assert_eq!(report.depth_exceeded, ["/quiche/plop"]);
+        assert!(
+            report
+                .file_names
+                .contains(&"/quiche/lorem ipsum.txt".to_string())
+        );
+        assert!(
+            !report
+                .file_names
+                .contains(&"/quiche/plop/random.bin".to_string())
+        );
+        Ok(())
+    }
+
     // USB to network transfer
     // read NTFS partition
     fn usb_to_net(&mut self) -> Result<(), Box<dyn Error>> {
@@ -308,7 +395,7 @@ impl IntegrationTester {
         }
 
         assert_eq!(
-            sha256(&format!("{}/bundle_test.tar", self.av_dir))?,
+            sha256(&format!("{}/{}/bundle_test.tar", self.av_dir, id))?,
             hex!("e47b5ae1ce68b002f52c31322b21de629d0a24bc139205208b10e903da6ddb9a")
         );
 
@@ -516,4 +603,11 @@ fn integration_tests() {
 
     tester.reset();
     tester.wipe().expect("wipe test");
+
+    let max_depth_conf = env::var("CARGO_MANIFEST_DIR").expect("missing env var")
+        + "/tests/resources/config_test_max_depth.toml";
+    tester.reset_with_conf(&max_depth_conf);
+    tester
+        .usb_to_usb_max_depth()
+        .expect("usb_to_usb_max_depth test");
 }

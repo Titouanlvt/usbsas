@@ -34,6 +34,7 @@ use usbsas_proto::{
 use usbsas_utils::clap::UsbsasClap;
 
 mod components;
+mod spinner;
 mod subscription;
 mod update;
 mod view;
@@ -208,6 +209,7 @@ pub enum Message {
     ResetDone(u64),
     /// Response of a request sent during the session with this generation
     Response(u64, Response),
+    Frame(std::time::Instant),
 }
 
 /// Kind of source opened by a successful `InitTransfer` request, it decides
@@ -232,7 +234,7 @@ pub enum Response {
     InitTransfer(Result<SrcOpened, String>),
     OpenPartition(Result<(), String>),
     /// Content of the requested directory
-    ReadDir(String, Result<Vec<FileInfo>, String>),
+    ReadDir(String, Result<proto::usbsas::ResponseReadDir, String>),
     /// A long running operation has started, status updates must be read
     StartStatus(Result<(), String>),
     /// Transfer report, received once the operation is done
@@ -333,6 +335,8 @@ pub struct GUI {
     current_dir: String,
     /// Paths of the files in `current_dir`
     current_files: Vec<String>,
+    /// Directory the user couldn't open because it's at the maximum depth
+    max_depth_warning: Option<String>,
     /// Steps already reached by the current operation, displayed as progress
     seen_status: BTreeSet<proto::common::Status>,
     version: String,
@@ -349,6 +353,7 @@ pub struct GUI {
     session_id: String,
     fullscreen: bool,
     socket_path: String,
+    spinner: spinner::Spinner,
 }
 
 impl GUI {
@@ -420,6 +425,7 @@ impl GUI {
                 download_pin: None,
                 current_dir: "".into(),
                 current_files: Vec::new(),
+                max_depth_warning: None,
                 selected: HashSet::new(),
                 seen_status: BTreeSet::new(),
                 version: env!("CARGO_PKG_VERSION").into(),
@@ -432,6 +438,7 @@ impl GUI {
                 session_id,
                 fullscreen: *matches.get_one::<bool>("fullscreen").unwrap_or(&false),
                 socket_path,
+                spinner: spinner::Spinner::new(200.0),
             },
             Task::none(),
         )
@@ -589,6 +596,7 @@ impl GUI {
         self.download_pin = None;
         self.current_dir = "".into();
         self.current_files = Vec::new();
+        self.max_depth_warning = None;
         self.selected = HashSet::new();
         self.seen_status = BTreeSet::new();
         self.report = None;

@@ -5,6 +5,10 @@ use procfs::process::{FDTarget, Process};
 use std::os::unix::io::RawFd;
 use syscallz::{Action, Cmp, Comparator, Context, Syscall};
 
+/// New seccomp context killing the process on unauthorized syscalls, with the
+/// rules common to all processes: `read` on `fds_read`, `write` on `fds_write`
+/// (and stdout / stderr), `close` on both, memory management without
+/// `PROT_EXEC`.
 pub(crate) fn new_context_with_common_rules(
     fds_read: Vec<RawFd>,
     fds_write: Vec<RawFd>,
@@ -160,6 +164,8 @@ pub(crate) fn new_context_with_common_rules(
     Ok(ctx)
 }
 
+/// Allow what libusb needs to use the device opened as `device_fd`: some
+/// `USBDEVFS_*` ioctls, and its eventfds and timerfds.
 pub(crate) fn apply_libusb_rules(ctx: &mut Context, device_fd: RawFd) -> Result<()> {
     // Allow close on device fd
     ctx.set_rule_for_syscall(
@@ -281,7 +287,6 @@ pub(crate) fn apply_libusb_rules(ctx: &mut Context, device_fd: RawFd) -> Result<
         ],
     )?;
 
-    // XXX poll() takes as first arg an array of struct pollfd, can we use comparators for this ?
     #[cfg(not(target_arch = "aarch64"))]
     ctx.allow_syscall(Syscall::poll)?;
     #[cfg(target_arch = "aarch64")]

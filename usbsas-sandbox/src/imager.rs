@@ -2,11 +2,15 @@ use crate::{Result, seccomp};
 use std::os::unix::io::RawFd;
 use syscallz::{Action, Cmp, Comparator, Syscall};
 
+/// Communication with dev2scsi, write on the output, stdin and terminal for
+/// the progress bar.
 pub fn seccomp(fds_read: Vec<RawFd>, fds_write: Vec<RawFd>) -> Result<()> {
     let mut fds_read = fds_read;
     // Allow read on stdin
     fds_read.push(0);
     let mut ctx = seccomp::new_context_with_common_rules(fds_read, fds_write)?;
+
+    ctx.allow_syscall(Syscall::getrandom)?;
 
     // The following rules are for the progress bar
     // ioctl(1, TCGETS, ..)

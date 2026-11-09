@@ -17,11 +17,12 @@
 //! ```
 
 use crate::{
-    Children, Devices, FileInfo, FileStatus, Transfer, TransferFiles, TransferReport, filter::Rules,
+    Children, Devices, FileInfo, FileStatus, Transfer, TransferFiles, TransferReport,
+    filter::Rules, path_depth,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use base16ct::HexDisplay;
-use log::{debug, error, info, trace};
+use log::{debug, error, info, trace, warn};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -129,9 +130,11 @@ pub trait RunState {
             .userid(proto::identifier::RequestUserId {})?
             .userid;
         if userid.is_empty() {
+            warn!("user not identified");
             comm.error("empty ID")?;
             return Ok(None);
         }
+        info!("user identified: '{userid}'");
         comm.userid(proto::usbsas::ResponseUserId {
             userid: userid.clone(),
         })?;
@@ -262,6 +265,7 @@ impl RunState for InitState {
                     let outfstype = match self.init_checks(&req, userid.clone(), &devices) {
                         Ok(outfstype) => outfstype,
                         Err(err) => {
+                            warn!("transfer request rejected: {err}");
                             comm.error(err)?;
                             continue;
                         }
@@ -283,6 +287,7 @@ impl RunState for InitState {
                         }));
                     }
                     _ => {
+                        warn!("disk image request rejected: no matching device");
                         comm.error("no matching device for imaging")?;
                         continue;
                     }
@@ -301,10 +306,11 @@ impl RunState for InitState {
                         }));
                     }
                     _ => {
-                        bail!("no matching device for wiping, waiting end");
+                        bail!("wipe request rejected: no matching device, waiting end");
                     }
                 },
                 Msg::End(_) => {
+                    info!("session ended by client");
                     children.end_wait_all(comm)?;
                     break;
                 }
@@ -376,7 +382,11 @@ impl InitState {
             devices.remove(&req.source),
             devices.remove(&req.destination),
         ) {
-            log::info!("Init transfer from {src:?} to {dst:?} for {userid:?}");
+            info!(
+                "user '{}' starts a transfer from {src} to {dst}",
+                userid.as_deref().unwrap_or_default()
+            );
+            debug!("transfer source: {src:?}, destination: {dst:?}");
 
             // Get max size of destination
             let max_dst_size = if let Device::Usb(ref mut usbdev) = dst {
@@ -411,6 +421,11 @@ impl InitState {
             } else {
                 false
             };
+
+            info!(
+                "transfer options: analyze: {analyze}, destination fs: {}",
+                outfstype.map_or("none", |fstype| fstype.as_str_name())
+            );
 
             let transfer = Transfer {
                 src,
@@ -481,6 +496,10 @@ impl RunState for OpenSrcUsbState {
             })?;
         src_usb.dev_size = Some(device.dev_size);
         src_usb.block_size = Some(device.block_size);
+        info!(
+            "source device opened (size: {}B, block size: {}B)",
+            device.dev_size, device.block_size
+        );
         // List partitions
         loop {
             match comm.recv_req()? {
@@ -495,6 +514,7 @@ impl RunState for OpenSrcUsbState {
                     })?;
                 }
                 Msg::OpenPartition(req) => {
+                    info!("user opens partition {} of the source device", req.index);
                     children
                         .scsi2files
                         .comm
@@ -503,6 +523,7 @@ impl RunState for OpenSrcUsbState {
                     break;
                 }
                 Msg::End(_) => {
+                    info!("session ended by client before file selection");
                     children.end_wait_all(comm)?;
                     return Ok(State::Exit);
                 }
@@ -536,18 +557,38 @@ impl RunState for BrowseSrcState {
         let selected = loop {
             match comm.recv_req()? {
                 Msg::ReadDir(req) => {
+                    if path_depth(&req.path) >= self.config.max_depth {
+                        warn!(
+                            "user tried to open '{}' beyond the maximum depth ({})",
+                            req.path, self.config.max_depth
+                        );
+                        comm.readdir(proto::usbsas::ResponseReadDir {
+                            filesinfo: Vec::new(),
+                            max_depth_reached: true,
+                        })?;
+                        continue;
+                    }
                     match src_reader
                         .comm
                         .readdir(proto::files::RequestReadDir { path: req.path })
                     {
                         Ok(res) => comm.readdir(proto::usbsas::ResponseReadDir {
                             filesinfo: res.filesinfo,
+                            max_depth_reached: false,
                         })?,
                         Err(err) => comm.error(err)?,
                     }
                     continue;
                 }
                 Msg::GetAttr(req) => {
+                    if path_depth(&req.path) > self.config.max_depth {
+                        warn!(
+                            "user tried to get attributes of '{}' beyond the maximum depth ({})",
+                            req.path, self.config.max_depth
+                        );
+                        comm.error("Maximum depth exceeded")?;
+                        continue;
+                    }
                     match src_reader
                         .comm
                         .getattr(proto::files::RequestGetAttr { path: req.path })
@@ -563,8 +604,16 @@ impl RunState for BrowseSrcState {
                     }
                     continue;
                 }
-                Msg::SelectFiles(req) => break req.selected,
+                Msg::SelectFiles(req) => {
+                    info!(
+                        "user selected {} item(s): {:?}",
+                        req.selected.len(),
+                        req.selected
+                    );
+                    break req.selected;
+                }
                 Msg::End(_) => {
+                    info!("session ended by client before file selection");
                     children.end_wait_all(comm)?;
                     return Ok(State::Exit);
                 }
@@ -599,18 +648,36 @@ impl RunState for DownloadSrcState {
             .comm
             .archiveinfos(proto::downloader::RequestArchiveInfos { path: remote_path })?
             .size;
+
         if self
             .transfer
             .max_dst_size
             .is_some_and(|size| archive_size > size)
         {
-            bail!("Files to download would be larger than destination size, aborting transfer");
+            bail!(
+                "Files to download ({archive_size}B) would be larger than destination size, aborting transfer"
+            );
         }
+        if self
+            .config
+            .available_space
+            .is_some_and(|size| archive_size > size)
+        {
+            bail!(
+                "Files to download ({archive_size}B) would be larger than available local space, aborting transfer"
+            );
+        }
+
+        info!(
+            "downloading archive of user '{}' ({archive_size}B) from {}",
+            self.transfer.userid, self.transfer.src
+        );
         children
             .downloader
             .comm
             .download(proto::downloader::RequestDownload {})?;
         self.forward_status(comm, &mut children.downloader.comm)?;
+        info!("archive downloaded");
         let selected = VecDeque::from(vec![String::from("/")]);
         Ok(State::FileSelection(FileSelectionState {
             config: self.config,
@@ -638,12 +705,27 @@ impl RunState for FileSelectionState {
             None
         };
         let selected_size = self.selected_to_filtered_files(children, max_file_size)?;
-        if self
-            .transfer
-            .max_dst_size
-            .is_some_and(|size| selected_size > size)
+        let (files_count, dirs_count) =
+            self.transfer
+                .files
+                .iter()
+                .fold((0, 0), |(files, dirs), (_, fi)| match fi.ftype {
+                    FileType::Regular => (files + 1, dirs),
+                    FileType::Directory => (files, dirs + 1),
+                    _ => (files, dirs),
+                });
+        info!(
+            "selection: {files_count} file(s) and {dirs_count} dir(s) ({selected_size}B), {} filtered, {} in error, {} beyond max depth",
+            self.transfer.files.filtered.len(),
+            self.transfer.files.errors.len(),
+            self.transfer.files.depth_exceeded.len()
+        );
+        if let Some(max_size) = self.transfer.max_dst_size
+            && selected_size > max_size
         {
-            bail!("Selected files size is larger than destination size, aborting transfer");
+            bail!(
+                "Selected files size ({selected_size}B) is larger than destination size ({max_size}B), aborting transfer"
+            );
         }
 
         if let Some(space) = self.config.available_space
@@ -651,7 +733,7 @@ impl RunState for FileSelectionState {
                 && 2 * selected_size > space)
                 || selected_size > space)
         {
-            bail!("Not enough space");
+            bail!("Not enough space ({space}B available for {selected_size}B selected)");
         };
 
         self.transfer.selected_size = Some(selected_size);
@@ -662,6 +744,7 @@ impl RunState for FileSelectionState {
         }
 
         if self.transfer.files.files.is_empty() {
+            warn!("transfer aborted: no files to copy");
             comm.error("No files to copy")?;
             let report = self.transfer.to_report("Aborted, nothing to copy");
             return Ok(State::End(EndState {
@@ -724,7 +807,18 @@ impl FileSelectionState {
                 continue;
             }
 
+            let depth = path_depth(&entry);
+            if depth > self.config.max_depth {
+                warn!(
+                    "'{entry}' skipped, beyond the maximum depth ({})",
+                    self.config.max_depth
+                );
+                self.transfer.files.depth_exceeded.push(entry.clone());
+                continue;
+            }
+
             if rules.match_all(entry.trim_start_matches('/')) {
+                info!("'{entry}' excluded by filter rules");
                 self.transfer.files.filtered.push(entry.clone());
                 continue;
             }
@@ -754,6 +848,16 @@ impl FileSelectionState {
                     match src_reader.comm.readdir(proto::files::RequestReadDir {
                         path: entry.clone(),
                     }) {
+                        Ok(rep) if depth >= self.config.max_depth => {
+                            // The directory is kept but not its content
+                            if !rep.filesinfo.is_empty() {
+                                warn!(
+                                    "content of '{entry}' skipped, maximum depth ({}) reached",
+                                    self.config.max_depth
+                                );
+                                self.transfer.files.depth_exceeded.push(entry.clone());
+                            }
+                        }
                         Ok(rep) => {
                             rep.filesinfo.iter().for_each(|file| {
                                 self.selected
@@ -809,7 +913,7 @@ impl FileSelectionState {
         children: &mut Children,
         total_size: u64,
     ) -> Result<()> {
-        trace!("tar src files");
+        info!("reading {total_size}B from {}", self.transfer.src);
         let mut current: u64 = 0;
 
         // Directory tree first
@@ -940,7 +1044,12 @@ impl FileSelectionState {
             .files2tar
             .comm
             .endfile(proto::writedst::RequestEndFile { path: path.into() })?;
-        fileinfo.cksum = Some(format!("{:x}", HexDisplay(&hasher.finalize())));
+        let cksum = format!("{:x}", HexDisplay(&hasher.finalize()));
+        info!(
+            "read '{path}' from source ({}B, sha256: {cksum})",
+            fileinfo.size
+        );
+        fileinfo.cksum = Some(cksum);
         Ok(())
     }
 }
@@ -954,7 +1063,7 @@ pub struct AnalyzeState {
 
 impl RunState for AnalyzeState {
     fn run(mut self, comm: &mut impl ProtoRespUsbsas, children: &mut Children) -> Result<State> {
-        trace!("analyze transfer");
+        info!("analyzing files");
         children
             .analyzer
             .comm
@@ -985,9 +1094,19 @@ impl RunState for AnalyzeState {
                         }
                     }
                 }),
-                _ => panic!("unsupported"),
+                _ => {
+                    error!("transfer aborted: unsupported remote analyzer version");
+                    comm.error("Unsupported remote analyzer version")?;
+                    let report = self
+                        .transfer
+                        .to_report("Unsupported remote analyzer version");
+                    return Ok(State::End(EndState {
+                        report: Some(report),
+                    }));
+                }
             }
         } else {
+            error!("transfer aborted: error analyzing files");
             comm.error("Error analyzing files")?;
             let report = self.transfer.to_report("Error analyzing files");
             return Ok(State::End(EndState {
@@ -996,12 +1115,26 @@ impl RunState for AnalyzeState {
         };
 
         self.transfer.analyze_report = report;
+        let (mut clean, mut dirty) = (0, 0);
+        self.transfer
+            .files
+            .iter()
+            .for_each(|(path, fi)| match fi.status {
+                FileStatus::Clean => clean += 1,
+                FileStatus::Dirty => {
+                    dirty += 1;
+                    warn!("'{path}' rejected by the analyzer");
+                }
+                _ => (),
+            });
+        info!("analysis done: {clean} clean, {dirty} dirty");
         if !self
             .transfer
             .files
             .iter()
             .any(|(_, fi)| fi.status == FileStatus::Clean)
         {
+            warn!("transfer aborted: nothing to copy after analysis");
             comm.error("Nothing to copy after analyzer, aborting")?;
             let report = self
                 .transfer
@@ -1042,6 +1175,8 @@ impl RunState for WriteDstFileState {
         if children.tar2files.locked {
             children.tar2files.unlock_with(1)?;
         }
+
+        info!("writing files for {}", self.transfer.dst);
 
         let mut current_size = 0;
 
@@ -1203,6 +1338,7 @@ pub struct TransferDstState {
 
 impl RunState for TransferDstState {
     fn run(self, comm: &mut impl ProtoRespUsbsas, children: &mut Children) -> Result<State> {
+        info!("transferring to {}", self.transfer.dst);
         match self.transfer.dst {
             Device::Usb(_) => self.write_fs(comm, children)?,
             Device::Network(_) => self.upload(comm, children)?,
@@ -1216,6 +1352,7 @@ impl RunState for TransferDstState {
             } else {
                 OutFileType::Tar
             };
+            info!("executing post copy command");
             children
                 .cmdexec
                 .comm
@@ -1226,7 +1363,17 @@ impl RunState for TransferDstState {
 
         let report = self.transfer.to_report("success");
         comm.done(Status::AllDone)?;
-        info!("transfer done, waiting end");
+        info!(
+            "transfer of user '{}' from {} to {} done: {} file(s) copied, {} filtered, {} rejected, {} in error, {} beyond max depth",
+            self.transfer.userid,
+            self.transfer.src,
+            self.transfer.dst,
+            report.file_names.len(),
+            report.filtered.len(),
+            report.rejected.len(),
+            report.errors.len(),
+            report.depth_exceeded.len()
+        );
         Ok(State::End(EndState {
             report: Some(report),
         }))
@@ -1261,7 +1408,7 @@ impl TransferDstState {
     }
 
     fn exec_cmd(&self, comm: &mut impl ProtoRespUsbsas, children: &mut Children) -> Result<()> {
-        trace!("exec cmd");
+        debug!("exec cmd");
         children.cmdexec.comm.exec(proto::cmdexec::RequestExec {})?;
         comm.done(Status::ExecCmd)?;
         Ok(())
@@ -1277,7 +1424,7 @@ pub struct ImgDiskState {
 
 impl RunState for ImgDiskState {
     fn run(mut self, comm: &mut impl ProtoRespUsbsas, children: &mut Children) -> Result<State> {
-        info!("image disk {}", self.device);
+        info!("disk image of USB device '{}'", self.device);
         comm.imgdisk(proto::usbsas::ResponseImgDisk {})?;
         let rep = children
             .scsi2files
@@ -1324,15 +1471,16 @@ impl RunState for ImgDiskState {
         let report = crate::report_diskimg(self.device);
 
         let session_id = self.config.session_id.unwrap();
+        let img_path = format!(
+            "{}/usbsas_imgdisk_{}.img",
+            self.config.out_directory, session_id
+        );
         std::fs::rename(
             format!("{}/usbsas_{}.img", self.config.out_directory, session_id),
-            format!(
-                "{}/usbsas_imgdisk_{}.img",
-                self.config.out_directory, session_id
-            ),
+            &img_path,
         )?;
 
-        info!("imgdisk done");
+        info!("disk image done ({dev_size}B): {img_path}");
         comm.done(Status::AllDone)?;
         Ok(State::End(EndState {
             report: Some(report),
@@ -1351,8 +1499,8 @@ pub struct WipeState {
 impl RunState for WipeState {
     fn run(self, comm: &mut impl ProtoRespUsbsas, children: &mut Children) -> Result<State> {
         info!(
-            "wipe device (serial: {}, fmt: {}, secure: {}",
-            self.device.serial,
+            "wipe of USB device '{}' (fs: {}, secure: {})",
+            self.device,
             self.outfstype.as_str_name(),
             !self.quick
         );
@@ -1414,11 +1562,13 @@ impl RunState for EndState {
                     .devices(comm, children, req.include_alt, &mut devices)
                     .context("listing devices")?,
                 Msg::Report(_) => {
+                    debug!("handle req report");
                     comm.report(proto::usbsas::ResponseReport {
                         report: self.report.clone(),
                     })?;
                 }
                 Msg::End(_) => {
+                    info!("session ended by client");
                     children.end_wait_all(comm)?;
                     break;
                 }

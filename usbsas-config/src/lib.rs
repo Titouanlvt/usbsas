@@ -81,6 +81,9 @@ pub struct Analyzer {
     pub analyze_net: bool,
     /// Analyze files transferred to the command
     pub analyze_cmd: bool,
+    /// Max time to wait for the analysis result
+    #[serde(default = "default_analyzer_poll_timeout")]
+    pub poll_timeout: u64,
 }
 
 /// Restrict devices to USB ports (`[usb_port_accesses]`). A port is a list of
@@ -124,6 +127,9 @@ pub struct Config {
     /// Local directory sources
     pub src_local_dirs: Option<Vec<LocalDir>>,
     pub filters: Option<Vec<Filter>>,
+    /// Maximum depth of the files of a transfer source
+    #[serde(default = "default_max_depth")]
+    pub max_depth: usize,
     pub post_copy: Option<PostCopy>,
     pub analyzer: Option<Analyzer>,
     pub usb_port_accesses: Option<UsbPortAccesses>,
@@ -142,6 +148,14 @@ pub struct Config {
 
 fn default_out_dir() -> String {
     String::from("/tmp/usbsas")
+}
+
+fn default_max_depth() -> usize {
+    20
+}
+
+fn default_analyzer_poll_timeout() -> u64 {
+    1800
 }
 
 /// Read the configuration file.

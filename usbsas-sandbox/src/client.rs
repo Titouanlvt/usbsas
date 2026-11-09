@@ -1,6 +1,9 @@
 use crate::{Result, seccomp};
 use syscallz::{Action, Cmp, Comparator, Syscall};
 
+/// landlock (`paths_ro`, `paths_rw` and `paths_rm`, see [`crate::landlock`])
+/// and seccomp allowing what the GUI needs (Unix and netlink sockets, GPU
+/// access...), without executing programs.
 pub fn sandbox(
     paths_ro: Option<&[&str]>,
     paths_rw: Option<&[&str]>,
@@ -71,6 +74,7 @@ pub fn sandbox(
     ctx.allow_syscall(Syscall::memfd_create)?;
     ctx.allow_syscall(Syscall::newfstatat)?;
     ctx.allow_syscall(Syscall::openat)?;
+    ctx.allow_syscall(Syscall::mkdir)?;
 
     #[cfg(not(target_arch = "aarch64"))]
     ctx.allow_syscall(Syscall::poll)?;

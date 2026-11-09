@@ -6,6 +6,7 @@ use std::{
 };
 use usbsas_proto::common::{FileInfo, FileType, FsType};
 
+/// exFAT reader.
 pub struct ExFatFsReader<T> {
     fs: ff::FatFs<T>,
 }
@@ -68,10 +69,11 @@ impl<T: Read + Seek> FSRead<T> for ExFatFsReader<T> {
 
     fn unmount_fs(self: Box<Self>) -> Result<T> {
         log::trace!("unmount_fs");
-        Ok(self.fs.into_inner_r()?)
+        Ok(self.fs.into_inner()?)
     }
 }
 
+/// exFAT writer.
 pub struct ExFatFsWriter<T> {
     fs: ff::FatFs<T>,
 }
@@ -129,6 +131,6 @@ impl<T: Read + Write + Seek> FSWrite<T> for ExFatFsWriter<T> {
 
     fn unmount_fs(self: Box<Self>) -> Result<T> {
         log::trace!("unmount_fs");
-        Ok(self.fs.into_inner_rw()?)
+        Ok(self.fs.into_inner()?)
     }
 }
