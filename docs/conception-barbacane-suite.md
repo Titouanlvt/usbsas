@@ -22,6 +22,7 @@ distinct** (ISO borne en ligne + ISO serveur).
 | Conservation | Journaux et rapports **1 an**, quarantaine **30 jours**, purge automatique. |
 | Cadre | Recommandations **ANSSI** / homologation, **Diffusion Restreinte** (IGI 1300), **RGPD**. |
 | Mises à jour | L'administrateur dépose le `.bcu` signé dans l'interface web ; le serveur le diffuse. |
+| Analyse | **ClamAV et YARA restent sur la borne** : toute la décision (sain / bloqué) est prise localement, comme en v1. Le serveur ne fait que gérer, superviser et stocker. |
 
 ## 2. Principes de sécurité
 
@@ -81,7 +82,7 @@ distinct** (ISO borne en ligne + ISO serveur).
   (interface web uniquement), séparées par le pare-feu.
 - Conteneurs non privilégiés, systèmes de fichiers en lecture seule, secrets hors des
   images, journaux vers le journal d'audit.
-- Analyse complémentaire des fichiers suspects (bac à sable, autres moteurs) :
+- L'analyse reste sur la borne. Éventuelle analyse complémentaire des fichiers suspects (bac à sable, autres moteurs) :
   **phase ultérieure**, dans une VM séparée et non un simple conteneur.
 
 ## 4. Flux
